@@ -1,6 +1,8 @@
 import taichi as ti
 import numpy as np
 import math
+import argparse
+import time
 
 # Initialize Taichi
 real = ti.f32
@@ -12,12 +14,13 @@ n_particles = 0  # Will be set after sphere generation
 n_grid = 64
 dx = 1 / n_grid
 inv_dx = 1 / dx
-dt = 5e-4  # Smaller timestep for stability
+dt = 2e-4  # Smaller timestep for stability with high Poisson's ratio
 p_vol = 1
 E = 50  # Young's modulus for elastic material (softer = more deformable without fracturing)
-mu = E * 0.5  # Shear modulus
-la = E * 0.5  # Lame's first parameter
-max_steps = 2048
+nu = 0.45  # Poisson's ratio (rubber-like but numerically stable)
+mu = E / (2 * (1 + nu))  # Shear modulus ≈ 17.24
+la = E * nu / ((1 + nu) * (1 - 2 * nu))  # Lame's first parameter ≈ 155.17
+state_buffer_size = 2  # Circular buffer with 2 frames
 gravity = 0.0  # Zero gravity
 
 # Sphere parameters
@@ -29,7 +32,7 @@ particle_spacing = 1.0 * dx  # Reduce particle count for better performance
 cube_half_extent = 0.03  # Smaller cube for gentler collisions
 
 # Damping for stability
-damping = 0.98  # Stronger velocity damping to prevent fracturing
+damping = 0.999  # Minimal damping to allow elastic recovery
 
 # Field definitions
 scalar = lambda: ti.field(dtype=real)
@@ -78,7 +81,7 @@ def generate_sphere_particles():
 def allocate_fields():
     """Allocate Taichi fields after n_particles is known"""
     ti.root.dense(ti.i, n_particles).place(particle_type)
-    ti.root.dense(ti.k, max_steps).dense(ti.l, n_particles).place(x, v, C, F)
+    ti.root.dense(ti.k, state_buffer_size).dense(ti.l, n_particles).place(x, v, C, F)
     ti.root.dense(ti.ijk, n_grid).place(grid_v_in, grid_m_in, grid_v_out)
     ti.root.place(cube_center, cube_velocity, cube_prev_center, cube_prev_velocity)
     ti.root.lazy_grad()
@@ -100,6 +103,15 @@ def init_particles(positions: ti.types.ndarray(element_dim=1)):
     cube_prev_velocity[None] = [0, 0, 0]
 
 @ti.kernel
+def reset_particles(positions: ti.types.ndarray(element_dim=1), frame: ti.i32):
+    """Reset particle states to initial conditions"""
+    for i in range(n_particles):
+        x[frame, i] = positions[i]
+        v[frame, i] = [0, 0, 0]
+        F[frame, i] = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+        C[frame, i] = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+
+@ti.kernel
 def clear_grid():
     for i, j, k in grid_m_in:
         grid_v_in[i, j, k] = [0, 0, 0]
@@ -107,30 +119,27 @@ def clear_grid():
         grid_v_out[i, j, k] = [0, 0, 0]
 
 @ti.kernel
-def p2g(f: ti.i32):
+def p2g(f_curr: ti.i32, f_next: ti.i32):
     """Particle to grid transfer with APIC"""
     for p in range(n_particles):
-        base = ti.cast(x[f, p] * inv_dx - 0.5, ti.i32)
-        fx = x[f, p] * inv_dx - ti.cast(base, ti.i32)
+        base = ti.cast(x[f_curr, p] * inv_dx - 0.5, ti.i32)
+        fx = x[f_curr, p] * inv_dx - ti.cast(base, ti.i32)
         w = [0.5 * (1.5 - fx)**2, 0.75 - (fx - 1)**2, 0.5 * (fx - 0.5)**2]
         
         # Update deformation gradient
-        new_F = (ti.Matrix.diag(dim=dim, val=1) + dt * C[f, p]) @ F[f, p]
+        new_F = (ti.Matrix.diag(dim=dim, val=1) + dt * C[f_curr, p]) @ F[f_curr, p]
         
-        # Clamp singular values to prevent inversion and fracturing
-        U, sig, V = ti.svd(new_F)
-        for d in ti.static(range(3)):
-            sig[d, d] = ti.max(0.6, ti.min(1.5, sig[d, d]))  # Tighter bounds to prevent fracturing
-        new_F = U @ sig @ V.transpose()
+        # No SVD clamping - pure elastic behavior
+        # (Removed plasticity model to allow full elastic recovery)
         
         J = new_F.determinant()
-        F[f + 1, p] = new_F
+        F[f_next, p] = new_F
         
         # Neo-Hookean elasticity
         r, s = ti.polar_decompose(new_F)
         cauchy = mu * (new_F @ new_F.transpose()) + ti.Matrix.identity(real, dim) * (la * ti.log(J) - mu)
         stress = -(dt * p_vol * 4 * inv_dx * inv_dx) * cauchy
-        affine = stress + C[f, p]
+        affine = stress + C[f_curr, p]
         
         # Scatter to grid with APIC
         for i in ti.static(range(3)):
@@ -139,7 +148,7 @@ def p2g(f: ti.i32):
                     offset = ti.Vector([i, j, k])
                     dpos = (ti.cast(ti.Vector([i, j, k]), real) - fx) * dx
                     weight = w[i][0] * w[j][1] * w[k][2]
-                    ti.atomic_add(grid_v_in[base + offset], weight * (v[f, p] + affine @ dpos))
+                    ti.atomic_add(grid_v_in[base + offset], weight * (v[f_curr, p] + affine @ dpos))
                     ti.atomic_add(grid_m_in[base + offset], weight)
 
 bound = 3
@@ -224,11 +233,11 @@ def grid_cube_contact():
                     grid_v_out[i, j, k] += 0.1 * cube_velocity[None]
 
 @ti.kernel
-def g2p(f: ti.i32):
+def g2p(f_curr: ti.i32, f_next: ti.i32):
     """Grid to particle transfer with APIC"""
     for p in range(n_particles):
-        base = ti.cast(x[f, p] * inv_dx - 0.5, ti.i32)
-        fx = x[f, p] * inv_dx - ti.cast(base, real)
+        base = ti.cast(x[f_curr, p] * inv_dx - 0.5, ti.i32)
+        fx = x[f_curr, p] * inv_dx - ti.cast(base, real)
         w = [0.5 * (1.5 - fx)**2, 0.75 - (fx - 1.0)**2, 0.5 * (fx - 0.5)**2]
         
         new_v = ti.Vector([0.0, 0.0, 0.0])
@@ -246,9 +255,9 @@ def g2p(f: ti.i32):
         # Apply damping
         new_v *= damping
         
-        v[f + 1, p] = new_v
-        x[f + 1, p] = x[f, p] + dt * v[f + 1, p]
-        C[f + 1, p] = new_C
+        v[f_next, p] = new_v
+        x[f_next, p] = x[f_curr, p] + dt * v[f_next, p]
+        C[f_next, p] = new_C
 
 def update_cube_from_mouse(gui):
     """Update cube position based on mouse input with filtered velocity"""
@@ -287,6 +296,57 @@ def update_cube_from_mouse(gui):
     cube_prev_velocity[None] = filtered_velocity
     cube_center[None] = new_center
     cube_velocity[None] = filtered_velocity
+
+def update_cube_test_mode(time_elapsed):
+    """Control cube position based on time for testing elastic behavior"""
+    # Test sequence:
+    # 0-2s: No contact (observe rest state)
+    # 2-5s: Apply force (push into sphere)
+    # 5-8s: Remove force (move away)
+    # 8-12s: Observe recovery
+    
+    if time_elapsed < 2.0:
+        # Initial position - no contact
+        target = [0.3, 0.5, 0.5]
+    elif time_elapsed < 5.0:
+        # Move cube to compress sphere
+        progress = (time_elapsed - 2.0) / 3.0
+        target = [0.3 + progress * 0.15, 0.5, 0.5]
+    elif time_elapsed < 8.0:
+        # Move cube away
+        progress = (time_elapsed - 5.0) / 3.0
+        target = [0.45 - progress * 0.15, 0.5, 0.5]
+    else:
+        # Stay away - observe recovery
+        target = [0.3, 0.5, 0.5]
+    
+    # Smooth movement
+    current = cube_center[None]
+    smoothing = 0.1
+    new_center = [
+        current[0] + (target[0] - current[0]) * smoothing,
+        current[1] + (target[1] - current[1]) * smoothing,
+        current[2] + (target[2] - current[2]) * smoothing
+    ]
+    
+    # Calculate velocity
+    velocity = [(new_center[i] - current[i]) / dt for i in range(3)]
+    
+    # Update cube state
+    cube_prev_center[None] = cube_center[None]
+    cube_prev_velocity[None] = velocity
+    cube_center[None] = new_center
+    cube_velocity[None] = velocity
+
+@ti.kernel
+def compute_deformation_metrics(f: ti.i32) -> ti.f32:
+    """Compute average deformation metric (determinant of F)"""
+    total_J = 0.0
+    for p in range(n_particles):
+        F_p = F[f, p]
+        J = F_p.determinant()
+        total_J += J
+    return total_J / ti.cast(n_particles, ti.f32)
 
 @ti.kernel
 def render_particles(f: ti.i32):
@@ -336,6 +396,11 @@ def draw_cube(gui):
     )
 
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Elastic Sphere Interaction Simulation')
+    parser.add_argument('--test', action='store_true', help='Run automated elastic test')
+    args = parser.parse_args()
+    
     # Generate sphere particles
     particle_positions = generate_sphere_particles()
     
@@ -349,27 +414,78 @@ def main():
     gui = ti.GUI("Elastic Sphere Interaction", res=screen_res)
     
     frame = 0
+    start_time = time.time()
+    test_phase_names = ["Rest", "Compression", "Release", "Recovery"]
+    
     while gui.running:
-        # Update cube from mouse
-        update_cube_from_mouse(gui)
+        # Handle keyboard events
+        for e in gui.get_events(ti.GUI.PRESS):
+            if e.key == 'r':
+                # Reset simulation
+                current_idx = frame % state_buffer_size
+                reset_particles(particle_positions, current_idx)
+                print("Simulation reset!")
+        
+        # Calculate elapsed time
+        time_elapsed = time.time() - start_time
+        
+        # Update cube position
+        if args.test:
+            update_cube_test_mode(time_elapsed)
+        else:
+            update_cube_from_mouse(gui)
         
         # Substeps (more with smaller dt)
         for s in range(20):
+            current_idx = frame % state_buffer_size
+            next_idx = (frame + 1) % state_buffer_size
+            
             clear_grid()
-            p2g(frame)
+            p2g(current_idx, next_idx)
             grid_op()
             grid_cube_contact()
-            g2p(frame)
-            frame = (frame + 1) % (max_steps - 1)
+            g2p(current_idx, next_idx)
+            frame += 1
         
         # Render
-        render_particles(frame)
+        current_idx = frame % state_buffer_size
+        render_particles(current_idx)
         gui.set_image(screen)
         draw_cube(gui)
         
+        # Compute deformation metrics
+        avg_J = compute_deformation_metrics(current_idx)
+        
         # Show info
         gui.text(content=f"Particles: {n_particles}", pos=(0.05, 0.95), color=0xFFFFFF)
-        gui.text(content="Move mouse to control white cube", pos=(0.05, 0.05), color=0xFFFFFF)
+        if args.test:
+            # Determine test phase
+            if time_elapsed < 2.0:
+                phase = "Rest"
+            elif time_elapsed < 5.0:
+                phase = "Compression"
+            elif time_elapsed < 8.0:
+                phase = "Release"
+            else:
+                phase = "Recovery"
+            
+            gui.text(content=f"TEST MODE - Phase: {phase}", pos=(0.05, 0.90), color=0xFFFF00)
+            gui.text(content=f"Time: {time_elapsed:.1f}s", pos=(0.05, 0.85), color=0xFFFFFF)
+            gui.text(content=f"Avg Deformation (J): {avg_J:.3f}", pos=(0.05, 0.80), color=0xFFFFFF)
+            gui.text(content=f"Expected J=1.0 for perfect recovery", pos=(0.05, 0.75), color=0xAAAAAA)
+            
+            # Exit after 12 seconds
+            if time_elapsed > 12.0:
+                print("\nTest Complete!")
+                print(f"Final average deformation: {avg_J:.3f}")
+                if abs(avg_J - 1.0) < 0.01:
+                    print("✓ ELASTIC: Material returned to original shape")
+                else:
+                    print("✗ PLASTIC: Material shows permanent deformation")
+                break
+        else:
+            gui.text(content="Move mouse to control white cube", pos=(0.05, 0.05), color=0xFFFFFF)
+            gui.text(content="Press 'R' to reset", pos=(0.05, 0.90), color=0xFFFFFF)
         
         gui.show()
 
