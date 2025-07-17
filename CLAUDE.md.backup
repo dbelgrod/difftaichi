@@ -81,7 +81,6 @@ with ti.ad.Tape(loss=loss):
 2. **Memory Issues**: Reduce particle count or simulation steps if OOM
 3. **Import Errors**: Install Taichi with `pip install taichi`
 4. **Performance**: Use `ti.cuda` backend for best performance
-
 <!-- BACKLOG.MD GUIDELINES START -->
 # Instructions for the usage of Backlog.md CLI Tool
 
@@ -267,5 +266,4 @@ A task is **Done** only when **ALL** of the following are complete:
 - **Always use `--plain` flag** when listing or viewing tasks for AI-friendly text output instead of using Backlog.md
   interactive UI.
 - When users mention to create a task, they mean to create a task using Backlog.md CLI tool.
-
 <!-- BACKLOG.MD GUIDELINES END -->
