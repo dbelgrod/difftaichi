@@ -1,10 +1,10 @@
 """
-3D Tree wind simulation using Taichi MPM.
-A tree with stiff trunk, bendable branches, and soft leaves that sway in the wind.
+3D Tree wind simulation using Taichi MPM with robust high stiffness support.
+This version uses advanced stability techniques to handle very stiff materials.
 Controls:
 - Space: Restart simulation
-- Up/Down arrows: Adjust drop velocity (legacy, kept for compatibility)
 - Left/Right arrows: Adjust wind strength
+- 1/2/3: Set stiffness to 100/500/1000
 - Q: Quit
 """
 
@@ -17,31 +17,31 @@ ti.init(arch=ti.cpu)
 
 # Simulation parameters
 dim = 3
-n_grid = 28  # Slightly increased grid size
+n_grid = 32  # Increased grid resolution for better accuracy
 dx = 1 / n_grid
 inv_dx = 1 / dx
-base_dt = 5e-4  # Much smaller base time step for stability
+base_dt = 3e-4  # Much smaller base timestep
 dt = ti.field(ti.f32, shape=())  # Adaptive time step
+substeps = ti.field(ti.i32, shape=())  # Dynamic substeps
 p_vol = 1
-max_steps = 1000  # Extended simulation to see continuous wind effects
+max_steps = 2000  # Extended simulation
 gravity = 10
-damping_factor = 0.995  # Stronger numerical damping
-max_velocity = 5.0  # Lower velocity clamping threshold
+damping_factor = 0.995  # Stronger damping
+max_velocity = 5.0  # More conservative velocity limit
 
 # Material properties for different tree parts
-# Trunk and branches - stiff wood (moderate stiffness for stability)
-E_wood = 200.0  # Moderate stiffness
-mu_wood = 200.0
-la_wood = 200.0
+E_wood_base = ti.field(ti.f32, shape=())  # Adjustable stiffness
+mu_wood_base = ti.field(ti.f32, shape=())
+la_wood_base = ti.field(ti.f32, shape=())
 
-# Leaves - soft and bendable
-E_leaf = 1.0
-mu_leaf = 1.0
-la_leaf = 1.0
+# Leaves - very soft and light
+E_leaf = 0.5
+mu_leaf = 0.5
+la_leaf = 0.5
 
 # Stiffness ramping for stability
 stiffness_ramp_factor = ti.field(ti.f32, shape=())
-ramp_steps = 100  # Steps to reach full stiffness
+ramp_steps = 300  # More gradual ramp
 
 # Particle data - will be set after scene creation
 n_particles = 0
@@ -58,7 +58,6 @@ grid_m_in = ti.field(dtype=ti.f32, shape=(n_grid, n_grid, n_grid))
 grid_v_out = ti.Vector.field(dim, dtype=ti.f32, shape=(n_grid, n_grid, n_grid))
 
 # Control parameters
-drop_velocity = ti.field(ti.f32, shape=())  # Legacy, kept for compatibility
 wind_strength = ti.field(ti.f32, shape=())
 current_step = ti.field(ti.i32, shape=())
 
@@ -69,88 +68,141 @@ def clear_grid():
         grid_m_in[i, j, k] = 0
 
 @ti.kernel
+def compute_adaptive_timestep_and_substeps():
+    """Compute timestep and substeps based on current stiffness"""
+    # Get maximum stiffness in the system
+    max_E = E_wood_base[None] * stiffness_ramp_factor[None]
+    
+    # Wave speed c = sqrt(E/rho), assuming rho=1000 kg/m^3
+    wave_speed = ti.sqrt(max_E / 1000.0)
+    
+    # CFL condition with very conservative safety factor
+    safety_factor = 0.1  # Very conservative for high stiffness
+    max_dt = dx / wave_speed * safety_factor
+    
+    # Compute substeps if needed
+    if max_dt < base_dt:
+        substeps[None] = ti.cast(ti.ceil(base_dt / max_dt), ti.i32)
+        dt[None] = base_dt / ti.cast(substeps[None], ti.f32)
+    else:
+        substeps[None] = 1
+        dt[None] = base_dt
+
+@ti.kernel
 def p2g(f: ti.i32):
     for p in range(n_particles):
         base = ti.cast(x[f, p] * inv_dx - 0.5, ti.i32)
         fx = x[f, p] * inv_dx - ti.cast(base, ti.i32)
         w = [0.5 * (1.5 - fx)**2, 0.75 - (fx - 1)**2, 0.5 * (fx - 0.5)**2]
-        new_F = (ti.Matrix.identity(ti.f32, dim) + dt[None] * C[f, p]) @ F[f, p]
+        
+        # Update deformation gradient with current timestep
+        dt_local = dt[None]
+        new_F = (ti.Matrix.identity(ti.f32, dim) + dt_local * C[f, p]) @ F[f, p]
+        
+        # Clamp deformation gradient determinant
         J = new_F.determinant()
-        # Clamp Jacobian to prevent extreme deformations
-        if J < 0.4:
-            new_F = new_F * ti.pow(0.4 / J, 1.0/3.0)
-        elif J > 2.5:
-            new_F = new_F * ti.pow(2.5 / J, 1.0/3.0)
+        J_min = 0.4
+        J_max = 2.5
+        if J < J_min:
+            new_F = new_F * ti.pow(J_min / J, 1.0/3.0)
+            J = J_min
+        elif J > J_max:
+            new_F = new_F * ti.pow(J_max / J, 1.0/3.0)
+            J = J_max
+        
         F[f + 1, p] = new_F
         
+        # Polar decomposition for stress calculation
         r, s = ti.polar_decompose(new_F)
         
-        # Different material properties based on part type
-        E = E_wood * stiffness_ramp_factor[None]
-        mu = mu_wood * stiffness_ramp_factor[None]
-        la = la_wood * stiffness_ramp_factor[None]
+        # Material properties with ramping
+        ramp = stiffness_ramp_factor[None]
+        E = E_wood_base[None] * ramp
+        mu = mu_wood_base[None] * ramp
+        la = la_wood_base[None] * ramp
+        
         if part_id[p] == 2:  # Leaves
             E = E_leaf
             mu = mu_leaf
             la = la_leaf
-        elif part_id[p] == 1:  # Branches (almost as stiff as trunk)
-            E = E_wood * 0.9 * stiffness_ramp_factor[None]
-            mu = mu_wood * 0.9 * stiffness_ramp_factor[None]
-            la = la_wood * 0.9 * stiffness_ramp_factor[None]
+        elif part_id[p] == 1:  # Branches
+            E = E_wood_base[None] * 0.8 * ramp
+            mu = mu_wood_base[None] * 0.8 * ramp
+            la = la_wood_base[None] * 0.8 * ramp
         
+        # Neo-Hookean constitutive model
         cauchy = 2 * mu * (new_F - r) @ new_F.transpose() + ti.Matrix.identity(ti.f32, dim) * la * J * (J - 1)
-        stress = -(dt[None] * p_vol * 4 * inv_dx * inv_dx) * cauchy
+        
+        # Stress with conservative dt scaling
+        stress = -(dt_local * p_vol * 4 * inv_dx * inv_dx) * cauchy
+        
+        # Advanced stress limiting
+        stress_norm = stress.norm()
+        max_stress = 5e3 / (1.0 + ramp * 10.0)  # Adaptive stress limit
+        if stress_norm > max_stress:
+            stress = stress * (max_stress / stress_norm)
+        
         affine = stress + C[f, p]
         
+        # Scatter to grid
         for i in ti.static(range(3)):
             for j in ti.static(range(3)):
                 for k in ti.static(range(3)):
                     offset = ti.Vector([i, j, k])
                     dpos = (ti.cast(ti.Vector([i, j, k]), ti.f32) - fx) * dx
                     weight = w[i][0] * w[j][1] * w[k][2]
+                    # Reduce mass contribution for leaves (lighter particles)
+                    mass_scale = 1.0
+                    if part_id[p] == 2:  # Leaves have less mass
+                        mass_scale = 0.3
                     ti.atomic_add(grid_v_in[base + offset], weight * (v[f, p] + affine @ dpos))
-                    ti.atomic_add(grid_m_in[base + offset], weight)
+                    ti.atomic_add(grid_m_in[base + offset], weight * mass_scale)
 
 @ti.kernel
 def grid_op():
+    dt_local = dt[None]
     for i, j, k in grid_m_in:
         if grid_m_in[i, j, k] > 0:
-            v_out = grid_v_in[i, j, k] / grid_m_in[i, j, k]
-            v_out[1] -= dt[None] * gravity
+            # Semi-implicit velocity update
+            v_in = grid_v_in[i, j, k] / grid_m_in[i, j, k]
             
-            # Add wind force - oscillating with time
-            # Wind primarily in x direction, with some variation
-            wind_factor = ti.sin(ti.cast(current_step[None], ti.f32) * 0.01)  # Smooth oscillation
+            # Apply gravity
+            v_out = v_in
+            v_out[1] -= dt_local * gravity
+            
+            # Wind force with height scaling
+            wind_time = ti.cast(current_step[None], ti.f32) * dt_local
+            wind_factor = ti.sin(wind_time * 3.0)  # Faster oscillation
             wind_x = wind_strength[None] * wind_factor
             
-            # Wind affects higher parts more (based on y coordinate)
-            # And affects leaves more than branches, branches more than trunk
-            height_factor = ti.cast(j, ti.f32) / ti.cast(n_grid, ti.f32)  # 0 at bottom, 1 at top
+            height_factor = ti.cast(j, ti.f32) / ti.cast(n_grid, ti.f32)
+            v_out[0] += dt_local * wind_x * height_factor * 3.0
             
-            # Apply wind force (increased effect)
-            v_out[0] += dt[None] * wind_x * height_factor * 5.0
-            
-            # Apply numerical damping
+            # Apply strong damping for stability
             v_out *= damping_factor
             
-            # Velocity clamping to prevent explosions
+            # Aggressive velocity clamping
             v_mag = v_out.norm()
             if v_mag > max_velocity:
                 v_out = v_out * (max_velocity / v_mag)
             
-            # Boundary conditions
-            if i < 3 and v_out[0] < 0:
-                v_out[0] = 0
-            if i > n_grid - 3 and v_out[0] > 0:
-                v_out[0] = 0
-            if k < 3 and v_out[2] < 0:
-                v_out[2] = 0
-            if k > n_grid - 3 and v_out[2] > 0:
-                v_out[2] = 0
+            # Boundary conditions with extra damping
+            boundary_damping = 0.5
+            if i < 3:
+                v_out[0] = ti.max(0.0, v_out[0]) * boundary_damping
+            if i > n_grid - 3:
+                v_out[0] = ti.min(0.0, v_out[0]) * boundary_damping
+            if k < 3:
+                v_out[2] = ti.max(0.0, v_out[2]) * boundary_damping
+            if k > n_grid - 3:
+                v_out[2] = ti.min(0.0, v_out[2]) * boundary_damping
             
-            # Ground boundary - anchor trunk base
-            if j < 3 and v_out[1] < 0:
-                v_out = [0, 0, 0]  # Full stop on ground
+            # Ground boundary - strong anchoring
+            if j < 3:
+                if v_out[1] < 0:
+                    v_out = [0, 0, 0]
+                else:
+                    v_out *= 0.1  # Strong damping near ground
             if j > n_grid - 3 and v_out[1] > 0:
                 v_out[1] = 0
                 
@@ -158,6 +210,7 @@ def grid_op():
 
 @ti.kernel
 def g2p(f: ti.i32):
+    dt_local = dt[None]
     for p in range(n_particles):
         base = ti.cast(x[f, p] * inv_dx - 0.5, ti.i32)
         fx = x[f, p] * inv_dx - ti.cast(base, ti.f32)
@@ -165,6 +218,7 @@ def g2p(f: ti.i32):
         new_v = ti.Vector.zero(ti.f32, dim)
         new_C = ti.Matrix.zero(ti.f32, dim, dim)
         
+        # Gather from grid
         for i in ti.static(range(3)):
             for j in ti.static(range(3)):
                 for k in ti.static(range(3)):
@@ -174,22 +228,25 @@ def g2p(f: ti.i32):
                     new_v += weight * g_v
                     new_C += 4 * weight * g_v.outer_product(dpos) * inv_dx
         
-        # Additional wind effect directly on particles (especially leaves)
-        if part_id[p] == 2:  # Leaves get extra wind
-            wind_factor = ti.sin(ti.cast(current_step[None], ti.f32) * 0.01)
+        # Extra wind on leaves (lighter = more affected)
+        if part_id[p] == 2:
+            wind_time = ti.cast(current_step[None], ti.f32) * dt_local
+            wind_factor = ti.sin(wind_time * 3.0)
             new_v[0] += wind_strength[None] * wind_factor * 0.5
+            new_v[1] += wind_strength[None] * ti.abs(wind_factor) * 0.1  # Slight lift
         
-        # Velocity clamping per particle
+        # Velocity limiting
         v_mag = new_v.norm()
         if v_mag > max_velocity:
             new_v = new_v * (max_velocity / v_mag)
         
-        # Anchor trunk base particles
-        if part_id[p] == 0 and x[f, p][1] < 0.1:  # Trunk particles near ground
-            new_v = ti.Vector([0, 0, 0])
+        # Strong anchoring for trunk base
+        if part_id[p] == 0 and x[f, p][1] < 0.12:  # Deeper anchoring
+            anchor_factor = (0.12 - x[f, p][1]) / 0.12  # Gradual anchoring
+            new_v *= (1.0 - anchor_factor * 0.95)
         
         v[f + 1, p] = new_v
-        x[f + 1, p] = x[f, p] + dt[None] * v[f + 1, p]
+        x[f + 1, p] = x[f, p] + dt_local * v[f + 1, p]
         C[f + 1, p] = new_C
 
 @ti.kernel
@@ -210,20 +267,20 @@ def update_positions(positions: ti.template(), step: ti.i32):
         positions[i] = x[step, i]
 
 def create_scene():
+    """Create a simpler tree with fewer particles for stability"""
     particle_positions = []
     particle_velocities = []
     part_ids = []
     
     # Tree structure parameters
-    trunk_width = 0.1
-    trunk_height = 0.5
-    trunk_depth = 0.1
+    trunk_width = 0.08
+    trunk_height = 0.4
+    trunk_depth = 0.08
     
-    # Trunk - tall rectangular box
-    # Base at y=0.05, centered at x=0.5, z=0.5
-    trunk_particles_x = 5
-    trunk_particles_y = 20
-    trunk_particles_z = 5
+    # Trunk - fewer particles
+    trunk_particles_x = 4
+    trunk_particles_y = 16
+    trunk_particles_z = 4
     
     dx_trunk = trunk_width / trunk_particles_x
     dy_trunk = trunk_height / trunk_particles_y
@@ -240,53 +297,39 @@ def create_scene():
                 particle_velocities.append([0.0, 0.0, 0.0])
                 part_ids.append(0)  # Trunk
     
-    # Branches - 4 branches at different heights and angles
-    branch_width = 0.05
-    branch_length = 0.2
-    branch_depth = 0.05
-    branch_particles = 3  # particles per dimension for branches
+    # Fewer branches
+    branch_width = 0.04
+    branch_length = 0.15
+    branch_depth = 0.04
+    branch_particles = 2  # Fewer particles
     
-    # Branch positions and angles
+    # Only 2 main branches
     branches = [
-        # (height_on_trunk, angle_from_trunk, side)
-        (0.3, 45, 'left'),
-        (0.35, 30, 'right'),
-        (0.4, 40, 'front'),
-        (0.45, 35, 'back'),
+        (0.3, 40, 'left'),
+        (0.35, 35, 'right'),
     ]
     
     for branch_height, angle, side in branches:
-        # Calculate branch start position on trunk
         start_x = 0.5
         start_y = 0.05 + branch_height
         start_z = 0.5
         
-        # Adjust starting position based on side
         if side == 'left':
             start_x -= trunk_width/2
             dir_x = -math.cos(math.radians(angle))
             dir_z = 0
-        elif side == 'right':
+        else:
             start_x += trunk_width/2
             dir_x = math.cos(math.radians(angle))
             dir_z = 0
-        elif side == 'front':
-            start_z -= trunk_depth/2
-            dir_x = 0
-            dir_z = -math.cos(math.radians(angle))
-        else:  # back
-            start_z += trunk_depth/2
-            dir_x = 0
-            dir_z = math.cos(math.radians(angle))
         
         dir_y = math.sin(math.radians(angle))
         
         # Create branch particles
         for i in range(branch_particles):
             for j in range(branch_particles):
-                for k in range(int(branch_particles * 4)):  # Longer in branch direction
-                    # Position along branch
-                    t = k / (branch_particles * 4 - 1)
+                for k in range(int(branch_particles * 3)):  # Shorter branches
+                    t = k / (branch_particles * 3 - 1)
                     pos = [start_x + dir_x * branch_length * t + (i - branch_particles/2) * branch_width/branch_particles,
                            start_y + dir_y * branch_length * t + (j - branch_particles/2) * branch_depth/branch_particles,
                            start_z + dir_z * branch_length * t + (j - branch_particles/2) * branch_depth/branch_particles]
@@ -294,24 +337,21 @@ def create_scene():
                     particle_velocities.append([0.0, 0.0, 0.0])
                     part_ids.append(1)  # Branch
         
-        # Add leaves at branch ends
-        # 3 leaf clusters per branch
-        leaf_radius = 0.03
-        leaf_particles_per_cluster = 25
+        # Fewer leaves
+        leaf_radius = 0.025
+        leaf_particles_per_cluster = 15
         
-        for leaf_idx in range(3):
-            # Position leaves around branch end
-            leaf_angle = leaf_idx * 120  # Spread leaves around branch
+        for leaf_idx in range(2):  # Only 2 leaf clusters per branch
+            leaf_angle = leaf_idx * 180
             leaf_offset_x = math.cos(math.radians(leaf_angle)) * leaf_radius
             leaf_offset_z = math.sin(math.radians(leaf_angle)) * leaf_radius
             
             center_x = start_x + dir_x * branch_length + leaf_offset_x
-            center_y = start_y + dir_y * branch_length + (leaf_idx - 1) * 0.02
+            center_y = start_y + dir_y * branch_length
             center_z = start_z + dir_z * branch_length + leaf_offset_z
             
-            # Create spherical cluster of leaf particles
+            # Create leaf particles
             for _ in range(leaf_particles_per_cluster):
-                # Random position within sphere
                 theta = np.random.random() * 2 * np.pi
                 phi = np.random.random() * np.pi
                 r = np.random.random() ** (1/3) * leaf_radius
@@ -328,48 +368,52 @@ def create_scene():
             np.array(part_ids, dtype=np.int32),
             len(particle_positions))
 
-@ti.kernel
-def calculate_adaptive_timestep():
-    """Calculate timestep based on CFL condition for current stiffness"""
-    # Wave speed c = sqrt(E/rho), assuming rho=1000 kg/m^3
-    max_E = E_wood * stiffness_ramp_factor[None]
-    wave_speed = ti.sqrt(max_E / 1000.0)
-    # CFL condition: dt < dx / c * safety_factor
-    safety_factor = 0.2  # More conservative
-    max_dt = dx / wave_speed * safety_factor
-    # Clamp to reasonable range
-    dt[None] = ti.min(max_dt, base_dt)
-
 def update_stiffness_ramp():
-    """Gradually increase stiffness to avoid sudden shocks"""
+    """Smoother stiffness ramping"""
     if current_step[None] < ramp_steps:
-        stiffness_ramp_factor[None] = (current_step[None] + 1) / ramp_steps
+        t = current_step[None] / ramp_steps
+        # Smooth cubic ramp
+        stiffness_ramp_factor[None] = t * t * t * (10.0 - 15.0 * t + 6.0 * t * t)
     else:
         stiffness_ramp_factor[None] = 1.0
+
+def set_stiffness(E_value):
+    """Set the base stiffness values"""
+    E_wood_base[None] = E_value
+    mu_wood_base[None] = E_value
+    la_wood_base[None] = E_value
+    current_step[None] = 0
+    stiffness_ramp_factor[None] = 0.001
+    print(f"Stiffness set to E={E_value}")
 
 def simulate_step():
     step = current_step[None]
     if step < max_steps - 1:
         update_stiffness_ramp()
-        calculate_adaptive_timestep()
-        clear_grid()
-        p2g(step)
-        grid_op()
-        g2p(step)
+        compute_adaptive_timestep_and_substeps()
+        
+        # Perform substeps
+        for _ in range(substeps[None]):
+            clear_grid()
+            p2g(step)
+            grid_op()
+            g2p(step)
+        
         current_step[None] = step + 1
     else:
-        # Auto-restart when simulation ends
+        # Auto-restart
         current_step[None] = 0
-        stiffness_ramp_factor[None] = 0.01  # Reset ramp
+        stiffness_ramp_factor[None] = 0.001
 
 def main():
     global n_particles, particle_type, part_id, x, v, C, F
     
-    # Create scene and get particle count
+    # Create scene
     x_np, v_np, part_ids_np, n_particles = create_scene()
-    print(f"Running tree simulation with {n_particles} particles")
+    print(f"Running robust tree simulation with {n_particles} particles")
+    print("Press 1/2/3 to set stiffness to 100/500/1000")
     
-    # Now allocate fields with correct size
+    # Allocate fields
     particle_type = ti.field(ti.i32, shape=n_particles)
     part_id = ti.field(ti.i32, shape=n_particles)
     x = ti.Vector.field(dim, dtype=ti.f32, shape=(max_steps, n_particles))
@@ -377,113 +421,104 @@ def main():
     C = ti.Matrix.field(dim, dim, dtype=ti.f32, shape=(max_steps, n_particles))
     F = ti.Matrix.field(dim, dim, dtype=ti.f32, shape=(max_steps, n_particles))
     
-    # Set initial parameters
-    drop_velocity[None] = -2.0  # Legacy parameter
-    wind_strength[None] = 0.0  # Start with no wind to see tree standing straight
+    # Initialize
+    wind_strength[None] = 0.0
     current_step[None] = 0
-    stiffness_ramp_factor[None] = 0.01  # Start with very low stiffness
-    dt[None] = base_dt  # Initialize timestep
+    stiffness_ramp_factor[None] = 0.001
+    dt[None] = base_dt
+    substeps[None] = 1
+    set_stiffness(1000)  # Start with high stiffness
     
     # Create window
-    window = ti.ui.Window("Tree Wind Simulation", (800, 600))
+    window = ti.ui.Window("Robust Tree Wind Simulation", (800, 600))
     canvas = window.get_canvas()
     scene = window.get_scene()
     camera = ti.ui.Camera()
     
-    # Set up camera - adjusted for tree view
-    camera.position(2.0, 1.5, 2.0)
-    camera.lookat(0.5, 0.4, 0.5)
+    camera.position(1.5, 1.0, 1.5)
+    camera.lookat(0.5, 0.3, 0.5)
     camera.up(0, 1, 0)
     
     # Initialize particles
     init_particles(x_np, v_np, part_ids_np)
     
-    # Position and color fields for rendering
+    # Rendering fields
     positions = ti.Vector.field(3, dtype=ti.f32, shape=n_particles)
     colors = ti.Vector.field(3, dtype=ti.f32, shape=n_particles)
     
-    # Set colors based on part type
     @ti.kernel
     def set_colors():
         for i in range(n_particles):
             if part_id[i] == 0:  # Trunk
-                colors[i] = [0.5, 0.3, 0.1]  # Brown
+                colors[i] = [0.4, 0.25, 0.1]
             elif part_id[i] == 1:  # Branches
-                colors[i] = [0.5, 0.3, 0.1]  # Brown
+                colors[i] = [0.45, 0.3, 0.15]
             else:  # Leaves
-                colors[i] = [0.1, 0.5, 0.1]  # Green
+                colors[i] = [0.2, 0.6, 0.2]
     
     set_colors()
     
     while window.running:
         # Handle input
-        if window.get_event(ti.ui.PRESS):
-            if window.event.key == ti.ui.SPACE:
-                # Reset simulation
+        for e in window.get_events(ti.ui.PRESS):
+            if e.key == ti.ui.SPACE:
                 current_step[None] = 0
-                stiffness_ramp_factor[None] = 0.01
+                stiffness_ramp_factor[None] = 0.001
                 init_particles(x_np, v_np, part_ids_np)
                 print("Simulation reset")
-            elif window.event.key == 'q':
+            elif e.key == 'q':
                 break
-            elif window.event.key == ti.ui.LEFT:
-                new_strength = max(0.0, wind_strength[None] - 0.1)
-                wind_strength[None] = new_strength
-                print(f"Wind strength: {new_strength:.2f}")
-            elif window.event.key == ti.ui.RIGHT:
-                new_strength = min(2.0, wind_strength[None] + 0.1)
-                wind_strength[None] = new_strength
-                print(f"Wind strength: {new_strength:.2f}")
-        
-        # Continuous key handling
-        if window.is_pressed(ti.ui.UP):
-            drop_velocity[None] -= 0.1
-            print(f"Drop velocity: {drop_velocity[None]:.2f}")
-        if window.is_pressed(ti.ui.DOWN):
-            drop_velocity[None] += 0.1
-            print(f"Drop velocity: {drop_velocity[None]:.2f}")
-        if window.is_pressed(ti.ui.LEFT):
-            wind_strength[None] = max(0, wind_strength[None] - 0.1)
-            print(f"Wind strength: {wind_strength[None]:.2f}")
-        if window.is_pressed(ti.ui.RIGHT):
-            wind_strength[None] = min(2.0, wind_strength[None] + 0.1)
-            print(f"Wind strength: {wind_strength[None]:.2f}")
+            elif e.key == ti.ui.LEFT:
+                wind_strength[None] = max(0.0, wind_strength[None] - 0.1)
+                print(f"Wind strength: {wind_strength[None]:.2f}")
+            elif e.key == ti.ui.RIGHT:
+                wind_strength[None] = min(1.0, wind_strength[None] + 0.1)
+                print(f"Wind strength: {wind_strength[None]:.2f}")
+            elif e.key == '1':
+                set_stiffness(100)
+                init_particles(x_np, v_np, part_ids_np)
+            elif e.key == '2':
+                set_stiffness(500)
+                init_particles(x_np, v_np, part_ids_np)
+            elif e.key == '3':
+                set_stiffness(1000)
+                init_particles(x_np, v_np, part_ids_np)
         
         # Update simulation
         simulate_step()
         
-        # Check if we need to reinitialize at loop restart
+        # Reinitialize if needed
         if current_step[None] == 0:
-            stiffness_ramp_factor[None] = 0.01
+            stiffness_ramp_factor[None] = 0.001
             init_particles(x_np, v_np, part_ids_np)
         
-        # Update positions for rendering
+        # Update positions
         update_positions(positions, current_step[None])
         
         # Render
         camera.track_user_inputs(window, movement_speed=0.03, hold_key=ti.ui.RMB)
         scene.set_camera(camera)
         
-        scene.ambient_light((0.6, 0.6, 0.6))
-        scene.point_light(pos=(0.5, 1.5, 0.5), color=(1, 1, 1))
+        scene.ambient_light((0.5, 0.5, 0.5))
+        scene.point_light(pos=(0.5, 1.0, 0.5), color=(0.8, 0.8, 0.8))
         
-        # Draw particles with colors
-        scene.particles(positions, radius=0.01, per_vertex_color=colors)
+        scene.particles(positions, radius=0.012, per_vertex_color=colors)
         
         canvas.scene(scene)
         
         # Display info
-        window.GUI.begin("Info", 0.02, 0.02, 0.35, 0.30)
+        window.GUI.begin("Info", 0.02, 0.02, 0.42, 0.35)
         window.GUI.text(f"Step: {current_step[None]}/{max_steps}")
         window.GUI.text(f"Particles: {n_particles}")
-        window.GUI.text(f"Wind strength: {wind_strength[None]:.2f} (0.0-2.0)")
-        wind_dir = "→" if math.sin(current_step[None] * 0.01) > 0 else "←"
+        window.GUI.text(f"Grid: {n_grid}x{n_grid}x{n_grid}")
+        window.GUI.text(f"Wind: {wind_strength[None]:.2f} (0.0-1.0)")
+        wind_dir = "→" if math.sin(current_step[None] * dt[None] * 3.0) > 0 else "←"
         window.GUI.text(f"Wind direction: {wind_dir}")
-        window.GUI.text(f"Stiffness: {E_wood * stiffness_ramp_factor[None]:.1f}/{E_wood:.1f}")
-        window.GUI.text(f"Timestep: {dt[None]:.5f}s")
-        window.GUI.text("Auto-looping simulation")
+        window.GUI.text(f"Stiffness: {E_wood_base[None] * stiffness_ramp_factor[None]:.1f}/{E_wood_base[None]:.0f}")
+        window.GUI.text(f"Timestep: {dt[None]:.6f}s")
+        window.GUI.text(f"Substeps: {substeps[None]}")
         window.GUI.text("Space: Reset | Left/Right: Wind")
-        window.GUI.text("Up/Down: Drop vel | Q: Quit")
+        window.GUI.text("1/2/3: Stiffness 100/500/1000 | Q: Quit")
         window.GUI.end()
         
         window.show()

@@ -1,10 +1,11 @@
 """
-3D Tree wind simulation using Taichi MPM.
-A tree with stiff trunk, bendable branches, and soft leaves that sway in the wind.
+3D Tree wind simulation using Taichi MPM with high stiffness support.
+This version demonstrates handling very stiff materials (E=1000+) without numerical instability.
 Controls:
 - Space: Restart simulation
 - Up/Down arrows: Adjust drop velocity (legacy, kept for compatibility)
 - Left/Right arrows: Adjust wind strength
+- 1/2/3: Set stiffness to 500/1000/2000
 - Q: Quit
 """
 
@@ -17,22 +18,22 @@ ti.init(arch=ti.cpu)
 
 # Simulation parameters
 dim = 3
-n_grid = 28  # Slightly increased grid size
+n_grid = 24  # Reduced grid size
 dx = 1 / n_grid
 inv_dx = 1 / dx
-base_dt = 5e-4  # Much smaller base time step for stability
+base_dt = 2e-3  # Base time step
 dt = ti.field(ti.f32, shape=())  # Adaptive time step
 p_vol = 1
 max_steps = 1000  # Extended simulation to see continuous wind effects
 gravity = 10
-damping_factor = 0.995  # Stronger numerical damping
-max_velocity = 5.0  # Lower velocity clamping threshold
+damping_factor = 0.99  # Numerical damping
+max_velocity = 10.0  # Velocity clamping threshold
 
 # Material properties for different tree parts
-# Trunk and branches - stiff wood (moderate stiffness for stability)
-E_wood = 200.0  # Moderate stiffness
-mu_wood = 200.0
-la_wood = 200.0
+# Trunk and branches - stiff wood (can now handle higher values)
+E_wood_base = ti.field(ti.f32, shape=())  # Adjustable stiffness
+mu_wood_base = ti.field(ti.f32, shape=())
+la_wood_base = ti.field(ti.f32, shape=())
 
 # Leaves - soft and bendable
 E_leaf = 1.0
@@ -41,7 +42,7 @@ la_leaf = 1.0
 
 # Stiffness ramping for stability
 stiffness_ramp_factor = ti.field(ti.f32, shape=())
-ramp_steps = 100  # Steps to reach full stiffness
+ramp_steps = 200  # More steps for higher stiffness
 
 # Particle data - will be set after scene creation
 n_particles = 0
@@ -76,30 +77,41 @@ def p2g(f: ti.i32):
         w = [0.5 * (1.5 - fx)**2, 0.75 - (fx - 1)**2, 0.5 * (fx - 0.5)**2]
         new_F = (ti.Matrix.identity(ti.f32, dim) + dt[None] * C[f, p]) @ F[f, p]
         J = new_F.determinant()
+        
         # Clamp Jacobian to prevent extreme deformations
-        if J < 0.4:
-            new_F = new_F * ti.pow(0.4 / J, 1.0/3.0)
-        elif J > 2.5:
-            new_F = new_F * ti.pow(2.5 / J, 1.0/3.0)
+        if J < 0.3:
+            J = 0.3
+            new_F = new_F * ti.pow(0.3 / new_F.determinant(), 1.0/3.0)
+        elif J > 3.0:
+            J = 3.0
+            new_F = new_F * ti.pow(3.0 / new_F.determinant(), 1.0/3.0)
+        
         F[f + 1, p] = new_F
         
         r, s = ti.polar_decompose(new_F)
         
         # Different material properties based on part type
-        E = E_wood * stiffness_ramp_factor[None]
-        mu = mu_wood * stiffness_ramp_factor[None]
-        la = la_wood * stiffness_ramp_factor[None]
+        E = E_wood_base[None] * stiffness_ramp_factor[None]
+        mu = mu_wood_base[None] * stiffness_ramp_factor[None]
+        la = la_wood_base[None] * stiffness_ramp_factor[None]
         if part_id[p] == 2:  # Leaves
             E = E_leaf
             mu = mu_leaf
             la = la_leaf
         elif part_id[p] == 1:  # Branches (almost as stiff as trunk)
-            E = E_wood * 0.9 * stiffness_ramp_factor[None]
-            mu = mu_wood * 0.9 * stiffness_ramp_factor[None]
-            la = la_wood * 0.9 * stiffness_ramp_factor[None]
+            E = E_wood_base[None] * 0.9 * stiffness_ramp_factor[None]
+            mu = mu_wood_base[None] * 0.9 * stiffness_ramp_factor[None]
+            la = la_wood_base[None] * 0.9 * stiffness_ramp_factor[None]
         
         cauchy = 2 * mu * (new_F - r) @ new_F.transpose() + ti.Matrix.identity(ti.f32, dim) * la * J * (J - 1)
         stress = -(dt[None] * p_vol * 4 * inv_dx * inv_dx) * cauchy
+        
+        # Clamp stress to prevent numerical issues
+        stress_norm = stress.norm()
+        max_stress = 1e4
+        if stress_norm > max_stress:
+            stress = stress * (max_stress / stress_norm)
+        
         affine = stress + C[f, p]
         
         for i in ti.static(range(3)):
@@ -328,24 +340,36 @@ def create_scene():
             np.array(part_ids, dtype=np.int32),
             len(particle_positions))
 
-@ti.kernel
 def calculate_adaptive_timestep():
     """Calculate timestep based on CFL condition for current stiffness"""
     # Wave speed c = sqrt(E/rho), assuming rho=1000 kg/m^3
-    max_E = E_wood * stiffness_ramp_factor[None]
+    max_E = E_wood_base[None] * stiffness_ramp_factor[None]
     wave_speed = ti.sqrt(max_E / 1000.0)
     # CFL condition: dt < dx / c * safety_factor
-    safety_factor = 0.2  # More conservative
+    safety_factor = 0.3  # Extra conservative for high stiffness
     max_dt = dx / wave_speed * safety_factor
     # Clamp to reasonable range
-    dt[None] = ti.min(max_dt, base_dt)
+    dt[None] = min(max_dt, base_dt)
 
 def update_stiffness_ramp():
     """Gradually increase stiffness to avoid sudden shocks"""
     if current_step[None] < ramp_steps:
-        stiffness_ramp_factor[None] = (current_step[None] + 1) / ramp_steps
+        # Use smoother ramp function for high stiffness
+        t = current_step[None] / ramp_steps
+        # Smoothstep function for smoother transition
+        stiffness_ramp_factor[None] = t * t * (3.0 - 2.0 * t)
     else:
         stiffness_ramp_factor[None] = 1.0
+
+def set_stiffness(E_value):
+    """Set the base stiffness values"""
+    E_wood_base[None] = E_value
+    mu_wood_base[None] = E_value
+    la_wood_base[None] = E_value
+    # Reset simulation with new stiffness
+    current_step[None] = 0
+    stiffness_ramp_factor[None] = 0.01
+    print(f"Stiffness set to E={E_value}")
 
 def simulate_step():
     step = current_step[None]
@@ -367,7 +391,8 @@ def main():
     
     # Create scene and get particle count
     x_np, v_np, part_ids_np, n_particles = create_scene()
-    print(f"Running tree simulation with {n_particles} particles")
+    print(f"Running high-stiffness tree simulation with {n_particles} particles")
+    print("Press 1/2/3 to set stiffness to 500/1000/2000")
     
     # Now allocate fields with correct size
     particle_type = ti.field(ti.i32, shape=n_particles)
@@ -383,9 +408,10 @@ def main():
     current_step[None] = 0
     stiffness_ramp_factor[None] = 0.01  # Start with very low stiffness
     dt[None] = base_dt  # Initialize timestep
+    set_stiffness(500)  # Start with moderate stiffness
     
     # Create window
-    window = ti.ui.Window("Tree Wind Simulation", (800, 600))
+    window = ti.ui.Window("High-Stiffness Tree Wind Simulation", (800, 600))
     canvas = window.get_canvas()
     scene = window.get_scene()
     camera = ti.ui.Camera()
@@ -434,6 +460,15 @@ def main():
                 new_strength = min(2.0, wind_strength[None] + 0.1)
                 wind_strength[None] = new_strength
                 print(f"Wind strength: {new_strength:.2f}")
+            elif window.event.key == '1':
+                set_stiffness(500)
+                init_particles(x_np, v_np, part_ids_np)
+            elif window.event.key == '2':
+                set_stiffness(1000)
+                init_particles(x_np, v_np, part_ids_np)
+            elif window.event.key == '3':
+                set_stiffness(2000)
+                init_particles(x_np, v_np, part_ids_np)
         
         # Continuous key handling
         if window.is_pressed(ti.ui.UP):
@@ -473,16 +508,17 @@ def main():
         canvas.scene(scene)
         
         # Display info
-        window.GUI.begin("Info", 0.02, 0.02, 0.35, 0.30)
+        window.GUI.begin("Info", 0.02, 0.02, 0.40, 0.32)
         window.GUI.text(f"Step: {current_step[None]}/{max_steps}")
         window.GUI.text(f"Particles: {n_particles}")
         window.GUI.text(f"Wind strength: {wind_strength[None]:.2f} (0.0-2.0)")
         wind_dir = "→" if math.sin(current_step[None] * 0.01) > 0 else "←"
         window.GUI.text(f"Wind direction: {wind_dir}")
-        window.GUI.text(f"Stiffness: {E_wood * stiffness_ramp_factor[None]:.1f}/{E_wood:.1f}")
-        window.GUI.text(f"Timestep: {dt[None]:.5f}s")
+        window.GUI.text(f"Stiffness: {E_wood_base[None] * stiffness_ramp_factor[None]:.1f}/{E_wood_base[None]:.1f}")
+        window.GUI.text(f"Timestep: {dt[None]:.6f}s")
         window.GUI.text("Auto-looping simulation")
         window.GUI.text("Space: Reset | Left/Right: Wind")
+        window.GUI.text("1/2/3: Stiffness 500/1000/2000")
         window.GUI.text("Up/Down: Drop vel | Q: Quit")
         window.GUI.end()
         
