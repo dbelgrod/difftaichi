@@ -11,6 +11,7 @@ Controls:
 import taichi as ti
 import numpy as np
 import math
+from tree_controls import MaterialPropertyController
 
 # Use CPU for better stability, change to ti.gpu if you have a good GPU
 ti.init(arch=ti.cpu)
@@ -24,20 +25,12 @@ base_dt = 5e-4  # Much smaller base time step for stability
 dt = ti.field(ti.f32, shape=())  # Adaptive time step
 p_vol = 1
 max_steps = 1000  # Extended simulation to see continuous wind effects
-gravity = 10
-damping_factor = 0.995  # Stronger numerical damping
+# gravity and damping_factor are now controlled by MaterialPropertyController
 max_velocity = 5.0  # Lower velocity clamping threshold
 
-# Material properties for different tree parts
-# Trunk and branches - stiff wood (moderate stiffness for stability)
-E_wood = 200.0  # Moderate stiffness
-mu_wood = 200.0
-la_wood = 200.0
-
-# Leaves - soft and bendable
-E_leaf = 1.0
-mu_leaf = 1.0
-la_leaf = 1.0
+# Material properties are now controlled by MaterialPropertyController
+# This allows real-time adjustment via GUI sliders
+material_controller = None  # Will be initialized in main()
 
 # Stiffness ramping for stability
 stiffness_ramp_factor = ti.field(ti.f32, shape=())
@@ -59,7 +52,7 @@ grid_v_out = ti.Vector.field(dim, dtype=ti.f32, shape=(n_grid, n_grid, n_grid))
 
 # Control parameters
 drop_velocity = ti.field(ti.f32, shape=())  # Legacy, kept for compatibility
-wind_strength = ti.field(ti.f32, shape=())
+# wind_strength is now in material_controller
 current_step = ti.field(ti.i32, shape=())
 
 @ti.kernel
@@ -86,17 +79,18 @@ def p2g(f: ti.i32):
         r, s = ti.polar_decompose(new_F)
         
         # Different material properties based on part type
-        E = E_wood * stiffness_ramp_factor[None]
-        mu = mu_wood * stiffness_ramp_factor[None]
-        la = la_wood * stiffness_ramp_factor[None]
+        # Read from controller for real-time adjustment
+        E = material_controller.E_wood[None] * stiffness_ramp_factor[None]
+        mu = material_controller.mu_wood[None] * stiffness_ramp_factor[None]
+        la = material_controller.la_wood[None] * stiffness_ramp_factor[None]
         if part_id[p] == 2:  # Leaves
-            E = E_leaf
-            mu = mu_leaf
-            la = la_leaf
+            E = material_controller.E_leaf[None]
+            mu = material_controller.mu_leaf[None]
+            la = material_controller.la_leaf[None]
         elif part_id[p] == 1:  # Branches (almost as stiff as trunk)
-            E = E_wood * 0.9 * stiffness_ramp_factor[None]
-            mu = mu_wood * 0.9 * stiffness_ramp_factor[None]
-            la = la_wood * 0.9 * stiffness_ramp_factor[None]
+            E = material_controller.E_wood[None] * 0.9 * stiffness_ramp_factor[None]
+            mu = material_controller.mu_wood[None] * 0.9 * stiffness_ramp_factor[None]
+            la = material_controller.la_wood[None] * 0.9 * stiffness_ramp_factor[None]
         
         cauchy = 2 * mu * (new_F - r) @ new_F.transpose() + ti.Matrix.identity(ti.f32, dim) * la * J * (J - 1)
         stress = -(dt[None] * p_vol * 4 * inv_dx * inv_dx) * cauchy
@@ -116,12 +110,12 @@ def grid_op():
     for i, j, k in grid_m_in:
         if grid_m_in[i, j, k] > 0:
             v_out = grid_v_in[i, j, k] / grid_m_in[i, j, k]
-            v_out[1] -= dt[None] * gravity
-            
+            v_out[1] -= dt[None] * material_controller.gravity[None]
+
             # Add wind force - oscillating with time
             # Wind primarily in x direction, with some variation
             wind_factor = ti.sin(ti.cast(current_step[None], ti.f32) * 0.01)  # Smooth oscillation
-            wind_x = wind_strength[None] * wind_factor
+            wind_x = material_controller.wind_strength[None] * wind_factor
             
             # Wind affects higher parts more (based on y coordinate)
             # And affects leaves more than branches, branches more than trunk
@@ -129,9 +123,9 @@ def grid_op():
             
             # Apply wind force (increased effect)
             v_out[0] += dt[None] * wind_x * height_factor * 5.0
-            
+
             # Apply numerical damping
-            v_out *= damping_factor
+            v_out *= material_controller.damping_factor[None]
             
             # Velocity clamping to prevent explosions
             v_mag = v_out.norm()
@@ -177,7 +171,7 @@ def g2p(f: ti.i32):
         # Additional wind effect directly on particles (especially leaves)
         if part_id[p] == 2:  # Leaves get extra wind
             wind_factor = ti.sin(ti.cast(current_step[None], ti.f32) * 0.01)
-            new_v[0] += wind_strength[None] * wind_factor * 0.5
+            new_v[0] += material_controller.wind_strength[None] * wind_factor * 0.5
         
         # Velocity clamping per particle
         v_mag = new_v.norm()
@@ -332,7 +326,7 @@ def create_scene():
 def calculate_adaptive_timestep():
     """Calculate timestep based on CFL condition for current stiffness"""
     # Wave speed c = sqrt(E/rho), assuming rho=1000 kg/m^3
-    max_E = E_wood * stiffness_ramp_factor[None]
+    max_E = material_controller.E_wood[None] * stiffness_ramp_factor[None]
     wave_speed = ti.sqrt(max_E / 1000.0)
     # CFL condition: dt < dx / c * safety_factor
     safety_factor = 0.2  # More conservative
@@ -363,8 +357,12 @@ def simulate_step():
         stiffness_ramp_factor[None] = 0.01  # Reset ramp
 
 def main():
-    global n_particles, particle_type, part_id, x, v, C, F
-    
+    global n_particles, particle_type, part_id, x, v, C, F, material_controller
+
+    # Initialize material property controller
+    material_controller = MaterialPropertyController()
+    material_controller.init_controls("normal")  # Start with normal preset
+
     # Create scene and get particle count
     x_np, v_np, part_ids_np, n_particles = create_scene()
     print(f"Running tree simulation with {n_particles} particles")
@@ -379,7 +377,6 @@ def main():
     
     # Set initial parameters
     drop_velocity[None] = -2.0  # Legacy parameter
-    wind_strength[None] = 0.0  # Start with no wind to see tree standing straight
     current_step[None] = 0
     stiffness_ramp_factor[None] = 0.01  # Start with very low stiffness
     dt[None] = base_dt  # Initialize timestep
@@ -427,14 +424,14 @@ def main():
             elif window.event.key == 'q':
                 break
             elif window.event.key == ti.ui.LEFT:
-                new_strength = max(0.0, wind_strength[None] - 0.1)
-                wind_strength[None] = new_strength
+                new_strength = max(0.0, material_controller.wind_strength[None] - 0.1)
+                material_controller.wind_strength[None] = new_strength
                 print(f"Wind strength: {new_strength:.2f}")
             elif window.event.key == ti.ui.RIGHT:
-                new_strength = min(2.0, wind_strength[None] + 0.1)
-                wind_strength[None] = new_strength
+                new_strength = min(5.0, material_controller.wind_strength[None] + 0.1)
+                material_controller.wind_strength[None] = new_strength
                 print(f"Wind strength: {new_strength:.2f}")
-        
+
         # Continuous key handling
         if window.is_pressed(ti.ui.UP):
             drop_velocity[None] -= 0.1
@@ -443,15 +440,20 @@ def main():
             drop_velocity[None] += 0.1
             print(f"Drop velocity: {drop_velocity[None]:.2f}")
         if window.is_pressed(ti.ui.LEFT):
-            wind_strength[None] = max(0, wind_strength[None] - 0.1)
-            print(f"Wind strength: {wind_strength[None]:.2f}")
+            material_controller.wind_strength[None] = max(0, material_controller.wind_strength[None] - 0.01)
         if window.is_pressed(ti.ui.RIGHT):
-            wind_strength[None] = min(2.0, wind_strength[None] + 0.1)
-            print(f"Wind strength: {wind_strength[None]:.2f}")
+            material_controller.wind_strength[None] = min(5.0, material_controller.wind_strength[None] + 0.01)
         
+        # Check if preset button was pressed (needs reset)
+        if material_controller.check_and_clear_reset_flag():
+            current_step[None] = 0
+            stiffness_ramp_factor[None] = 0.01
+            init_particles(x_np, v_np, part_ids_np)
+            print("Simulation reset with new preset")
+
         # Update simulation
         simulate_step()
-        
+
         # Check if we need to reinitialize at loop restart
         if current_step[None] == 0:
             stiffness_ramp_factor[None] = 0.01
@@ -472,20 +474,27 @@ def main():
         
         canvas.scene(scene)
         
-        # Display info
-        window.GUI.begin("Info", 0.02, 0.02, 0.35, 0.30)
+        # Display info panel
+        window.GUI.begin("Info", 0.02, 0.02, 0.35, 0.32)
         window.GUI.text(f"Step: {current_step[None]}/{max_steps}")
         window.GUI.text(f"Particles: {n_particles}")
-        window.GUI.text(f"Wind strength: {wind_strength[None]:.2f} (0.0-2.0)")
+        window.GUI.text(f"Wind: {material_controller.wind_strength[None]:.2f}")
         wind_dir = "→" if math.sin(current_step[None] * 0.01) > 0 else "←"
-        window.GUI.text(f"Wind direction: {wind_dir}")
-        window.GUI.text(f"Stiffness: {E_wood * stiffness_ramp_factor[None]:.1f}/{E_wood:.1f}")
+        window.GUI.text(f"Wind dir: {wind_dir}")
+        window.GUI.text(f"Wood E: {material_controller.E_wood[None] * stiffness_ramp_factor[None]:.0f}")
+        window.GUI.text(f"Leaf E: {material_controller.E_leaf[None]:.1f}")
+        window.GUI.text(f"Gravity: {material_controller.gravity[None]:.1f}")
+        window.GUI.text(f"Damping: {material_controller.damping_factor[None]:.3f}")
         window.GUI.text(f"Timestep: {dt[None]:.5f}s")
+        window.GUI.text("")
         window.GUI.text("Auto-looping simulation")
-        window.GUI.text("Space: Reset | Left/Right: Wind")
+        window.GUI.text("Space: Reset | Arrows: Wind")
         window.GUI.text("Up/Down: Drop vel | Q: Quit")
         window.GUI.end()
-        
+
+        # Display material controls panel
+        material_controller.render_controls(window)
+
         window.show()
 
 if __name__ == '__main__':
