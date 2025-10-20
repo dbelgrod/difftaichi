@@ -105,14 +105,27 @@ class MaterialPropertyController:
 
         config = presets.get(preset, presets["normal"])
 
-        # Set material properties
-        self.E_wood[None] = config["E_wood"]
-        self.mu_wood[None] = config["E_wood"]  # Simplified: mu = E
-        self.la_wood[None] = config["E_wood"]  # Simplified: lambda = E
+        # Poisson's ratios for realistic material behavior
+        # Wood: 0.2 (allows more compressibility)
+        # Leaves: 0.3 (standard for soft biological materials)
+        nu_wood = 0.2
+        nu_leaf = 0.3
 
-        self.E_leaf[None] = config["E_leaf"]
-        self.mu_leaf[None] = config["E_leaf"]
-        self.la_leaf[None] = config["E_leaf"]
+        # Calculate Lamé parameters from Young's modulus
+        # mu (shear modulus) = E / (2 * (1 + nu))
+        # lambda = (E * nu) / ((1 + nu) * (1 - 2*nu))
+        E_wood = config["E_wood"]
+        E_leaf = config["E_leaf"]
+
+        # Set wood properties with correct Lamé parameters
+        self.E_wood[None] = E_wood
+        self.mu_wood[None] = E_wood / (2.0 * (1.0 + nu_wood))
+        self.la_wood[None] = (E_wood * nu_wood) / ((1.0 + nu_wood) * (1.0 - 2.0 * nu_wood))
+
+        # Set leaf properties with correct Lamé parameters
+        self.E_leaf[None] = E_leaf
+        self.mu_leaf[None] = E_leaf / (2.0 * (1.0 + nu_leaf))
+        self.la_leaf[None] = (E_leaf * nu_leaf) / ((1.0 + nu_leaf) * (1.0 - 2.0 * nu_leaf))
 
         # Set environmental parameters
         self.wind_strength[None] = config["wind_strength"]
@@ -152,8 +165,10 @@ class MaterialPropertyController:
         )
         if abs(new_E_wood - self.E_wood[None]) > 0.1:
             self.E_wood[None] = new_E_wood
-            self.mu_wood[None] = new_E_wood  # Keep mu = E
-            self.la_wood[None] = new_E_wood  # Keep lambda = E
+            # Recalculate Lamé parameters with nu=0.2
+            nu_wood = 0.2
+            self.mu_wood[None] = new_E_wood / (2.0 * (1.0 + nu_wood))
+            self.la_wood[None] = (new_E_wood * nu_wood) / ((1.0 + nu_wood) * (1.0 - 2.0 * nu_wood))
             changed = True
 
         # Leaf stiffness slider
@@ -165,8 +180,10 @@ class MaterialPropertyController:
         )
         if abs(new_E_leaf - self.E_leaf[None]) > 0.01:
             self.E_leaf[None] = new_E_leaf
-            self.mu_leaf[None] = new_E_leaf
-            self.la_leaf[None] = new_E_leaf
+            # Recalculate Lamé parameters with nu=0.3
+            nu_leaf = 0.3
+            self.mu_leaf[None] = new_E_leaf / (2.0 * (1.0 + nu_leaf))
+            self.la_leaf[None] = (new_E_leaf * nu_leaf) / ((1.0 + nu_leaf) * (1.0 - 2.0 * nu_leaf))
             changed = True
 
         window.GUI.text("")  # Separator

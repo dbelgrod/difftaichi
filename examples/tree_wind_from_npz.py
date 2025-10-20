@@ -30,7 +30,7 @@ dx = 1 / n_grid
 inv_dx = 1 / dx
 base_dt = 5e-4  # Base time step for stability
 dt = ti.field(ti.f32, shape=())  # Adaptive time step
-p_vol = 1
+p_vol = 0.5  # Particle volume (reduced to decrease volume preservation forces)
 buffer_size = 1000  # Circular buffer size for history
 # gravity and damping_factor are now controlled by MaterialPropertyController
 max_velocity = 5.0  # Velocity clamping threshold
@@ -80,10 +80,11 @@ def p2g(f: ti.i32, f_next: ti.i32):
         J = new_F.determinant()
 
         # Clamp Jacobian to prevent extreme deformations
-        if J < 0.4:
-            new_F = new_F * ti.pow(0.4 / J, 1.0/3.0)
-        elif J > 2.5:
-            new_F = new_F * ti.pow(2.5 / J, 1.0/3.0)
+        # Wider range [0.2, 4.0] allows more natural deformation
+        if J < 0.2:
+            new_F = new_F * ti.pow(0.2 / J, 1.0/3.0)
+        elif J > 4.0:
+            new_F = new_F * ti.pow(4.0 / J, 1.0/3.0)
 
         F[f_next, p] = new_F
 
@@ -120,9 +121,8 @@ def grid_op():
             v_out = grid_v_in[i, j, k] / grid_m_in[i, j, k]
             v_out[1] -= dt[None] * material_controller.gravity[None]
 
-            # Add wind force - oscillating with time
-            wind_factor = ti.sin(ti.cast(actual_step_count[None], ti.f32) * 0.01)
-            wind_x = material_controller.wind_strength[None] * wind_factor
+            # Add wind force - constant left direction
+            wind_x = -material_controller.wind_strength[None]
 
             # Wind affects higher parts more
             height_factor = ti.cast(j, ti.f32) / ti.cast(n_grid, ti.f32)
@@ -180,9 +180,13 @@ def g2p(f: ti.i32, f_next: ti.i32):
         if v_mag > max_velocity:
             new_v = new_v * (max_velocity / v_mag)
 
-        # Anchor trunk base particles (wood particles near ground)
-        if material_id[p] == 0 and x[f, p][1] < 0.15:
-            new_v = ti.Vector([0, 0, 0])
+        # Gradual anchor for trunk base (wood particles only)
+        # Smooth continuous transition from fully anchored at ground to free at top
+        if material_id[p] == 0:
+            anchor_height = 0.25  # Upper limit of anchor influence
+            # Calculate anchor strength: 1.0 at y=0, gradually decreases to 0.0 at y=anchor_height
+            anchor_strength = ti.max(0.0, 1.0 - (x[f, p][1] / anchor_height))
+            new_v *= (1.0 - anchor_strength)  # Scale velocity by (1 - anchor_strength)
 
         v[f_next, p] = new_v
         x[f_next, p] = x[f, p] + dt[None] * v[f_next, p]
@@ -463,8 +467,7 @@ def main():
         window.GUI.text(f"Particles: {n_particles}")
         window.GUI.text(f"Buffer: {buffer_size}")
         window.GUI.text(f"Wind: {material_controller.wind_strength[None]:.2f}")
-        wind_dir = "→" if math.sin(actual_step_count[None] * 0.01) > 0 else "←"
-        window.GUI.text(f"Wind dir: {wind_dir}")
+        window.GUI.text("Wind dir: ←")
         window.GUI.text(f"Wood E: {material_controller.E_wood[None] * stiffness_ramp_factor[None]:.0f}")
         window.GUI.text(f"Leaf E: {material_controller.E_leaf[None]:.1f}")
         window.GUI.text(f"Gravity: {material_controller.gravity[None]:.1f}")

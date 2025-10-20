@@ -1,8 +1,8 @@
-taichi>=1.1.0
-matplotlib
-numpy
-opencv-python
-scipy
-imageio
-torch
-torchvision
+taichi==1.7.2
+matplotlib==3.10.7
+numpy==2.3.4
+opencv-python==4.11.0.86
+scipy==1.16.2
+imageio==2.37.0
+torch>=2.0.0
+torchvision>=0.15.0

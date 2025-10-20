@@ -6,20 +6,62 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 DiffTaichi is a differentiable programming framework for physical simulation. It's a collection of example simulators that demonstrate how to use the Taichi programming language for differentiable physics simulations. The project enables gradient-based optimization of physical systems, allowing neural network controllers to be trained via gradient descent rather than reinforcement learning.
 
-## Key Commands
+## Environment Setup
+
+### Python Version
+
+This project requires **Python 3.12.11** (specified in `.python-version`).
+
+### Virtual Environment
+
+The recommended virtual environment is located at:
+```
+/Users/davidbelgrod/difftaichi-venv/
+```
+
+**Why external venv?** The repo is on a mounted volume (`/Volumes/Repos/difftaichi/`) which has slow I/O for venv operations. The venv is in the home directory for better performance.
+
+### Setup with uv (Recommended)
 
 ```bash
+# uv automatically reads .python-version
+uv venv /Users/davidbelgrod/difftaichi-venv --python 3.12
+
+# Install dependencies
+uv pip install -r requirements.txt --python /Users/davidbelgrod/difftaichi-venv/bin/python
+
+# Run simulations
+/Users/davidbelgrod/difftaichi-venv/bin/python examples/tree_wind_from_npz.py
+```
+
+### Setup with traditional venv
+
+```bash
+# Create virtual environment
+python3.12 -m venv /Users/davidbelgrod/difftaichi-venv
+
+# Activate
+source /Users/davidbelgrod/difftaichi-venv/bin/activate
+
 # Install dependencies
 pip install -r requirements.txt
 
-# Run any example simulator
-python3 examples/<simulator_name>.py
+# Run simulations
+python examples/tree_wind_from_npz.py
+```
+
+## Key Commands
+
+```bash
+# Run any example simulator (with venv)
+/Users/davidbelgrod/difftaichi-venv/bin/python examples/<simulator_name>.py
 
 # Common simulators:
-python3 examples/diffmpm.py      # Elastic object simulation
-python3 examples/liquid.py       # 3D fluid simulation
-python3 examples/billiards.py    # Billiard ball simulation
-python3 examples/rigid_body.py   # Rigid body simulation
+/Users/davidbelgrod/difftaichi-venv/bin/python examples/diffmpm.py      # Elastic object simulation
+/Users/davidbelgrod/difftaichi-venv/bin/python examples/liquid.py       # 3D fluid simulation
+/Users/davidbelgrod/difftaichi-venv/bin/python examples/billiards.py    # Billiard ball simulation
+/Users/davidbelgrod/difftaichi-venv/bin/python examples/rigid_body.py   # Rigid body simulation
+/Users/davidbelgrod/difftaichi-venv/bin/python examples/tree_wind_from_npz.py  # Tree wind simulation (MPM)
 ```
 
 ## Architecture Overview
