@@ -5,14 +5,20 @@ This module provides an interactive control system for real-time adjustment
 of material properties and simulation parameters using Taichi GGUI sliders.
 
 Usage:
-    from tree_controls import MaterialPropertyController
+    from tree_controls import MaterialPropertyController, RecordingManager
 
     # Initialize controller
     controller = MaterialPropertyController()
     controller.init_controls()
 
+    # Initialize recording
+    recorder = RecordingManager()
+
     # In render loop
     controller.render_controls(window)
+    recorder.render_ui(window)
+    if recorder.is_recording[None]:
+        recorder.capture_frame(window)
 
     # Access current values
     E_wood = controller.E_wood[None]
@@ -20,6 +26,8 @@ Usage:
 """
 
 import taichi as ti
+import os
+from datetime import datetime
 
 
 class MaterialPropertyController:
@@ -55,6 +63,7 @@ class MaterialPropertyController:
         # UI state
         self.show_advanced = False
         self.needs_reset = False
+        self.reset_requested = False
 
     def init_controls(self, preset="normal"):
         """
@@ -123,31 +132,12 @@ class MaterialPropertyController:
         changed = False
 
         # Material Controls Panel
-        window.GUI.begin("Material Controls", 0.62, 0.02, 0.36, 0.50)
+        window.GUI.begin("Material Controls", 0.62, 0.02, 0.36, 0.45)
 
-        # Preset buttons
-        window.GUI.text("Presets:")
-        if window.GUI.button("Soft"):
-            self.init_controls("soft")
-            self.needs_reset = True
-            changed = True
-
-        window.GUI.text(" ")  # Spacing
-        if window.GUI.button("Normal"):
-            self.init_controls("normal")
-            self.needs_reset = True
-            changed = True
-
-        window.GUI.text(" ")  # Spacing
-        if window.GUI.button("Stiff"):
-            self.init_controls("stiff")
-            self.needs_reset = True
-            changed = True
-
-        window.GUI.text(" ")  # Spacing
-        if window.GUI.button("Very Stiff"):
-            self.init_controls("very_stiff")
-            self.needs_reset = True
+        # Reset button at top
+        window.GUI.text("Simulation Control:")
+        if window.GUI.button("Reset Simulation"):
+            self.reset_requested = True
             changed = True
 
         window.GUI.text("")  # Separator
@@ -220,9 +210,9 @@ class MaterialPropertyController:
 
         window.GUI.text("")  # Separator
         window.GUI.text("Controls:")
-        window.GUI.text("Presets: Quick property sets")
-        window.GUI.text("Sliders: Fine-tune values")
-        window.GUI.text("Arrows: Adjust wind")
+        window.GUI.text("Reset: Restart from step 0")
+        window.GUI.text("Sliders: Adjust properties live")
+        window.GUI.text("Arrows: Quick wind adjust")
 
         window.GUI.end()
 
@@ -233,10 +223,10 @@ class MaterialPropertyController:
         Check if a reset is needed and clear the flag.
 
         Returns:
-            bool: True if reset was requested by preset button
+            bool: True if reset was requested
         """
-        if self.needs_reset:
-            self.needs_reset = False
+        if self.reset_requested:
+            self.reset_requested = False
             return True
         return False
 
@@ -286,3 +276,150 @@ class MaterialPropertyController:
             float: damping_factor
         """
         return self.damping_factor[None]
+
+
+class RecordingManager:
+    """
+    Video recording manager for Taichi simulations.
+
+    Captures frames from the simulation window and creates MP4 videos
+    at 10 fps using Taichi's VideoManager.
+    """
+
+    def __init__(self):
+        """Initialize recording manager."""
+        self.is_recording = ti.field(ti.i32, shape=())
+        self.frame_count = 0
+        self.sim_frame_count = 0  # Track simulation frames for skipping
+        self.video_manager = None
+        self.output_dir = None
+        self.is_recording[None] = 0
+
+        # Recording settings
+        self.max_frames = 30  # Capture exactly 30 frames (3 seconds at 10 fps)
+        self.frame_skip = 6  # Capture every 6th simulation frame (60fps sim -> 10fps video)
+
+    def start_recording(self):
+        """
+        Start recording video.
+        Will capture exactly max_frames frames (30 frames = 3 seconds at 10 fps).
+        """
+        print(f"[RecordingManager] start_recording() called - will capture {self.max_frames} frames")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.output_dir = f"recordings/recording_{timestamp}"
+        os.makedirs(self.output_dir, exist_ok=True)
+        print(f"[RecordingManager] Created directory: {self.output_dir}")
+
+        # Initialize Taichi VideoManager for 10 fps output
+        self.video_manager = ti.tools.VideoManager(
+            output_dir=self.output_dir,
+            framerate=10,
+            automatic_build=False
+        )
+        print("[RecordingManager] VideoManager initialized")
+
+        self.is_recording[None] = 1
+        self.frame_count = 0
+        self.sim_frame_count = 0
+        print(f"[RecordingManager] Recording started - will auto-stop after {self.max_frames} frames")
+
+    def capture_frame(self, window):
+        """
+        Capture current frame from window with frame skipping.
+        Only captures every Nth simulation frame to match target fps.
+        Auto-stops after max_frames captured.
+
+        Args:
+            window: Taichi GGUI window instance
+        """
+        if self.is_recording[None]:
+            self.sim_frame_count += 1
+
+            # Skip frames to match target fps (capture every 6th frame)
+            if self.sim_frame_count % self.frame_skip != 0:
+                return
+
+            # Check if we've captured enough frames
+            if self.frame_count >= self.max_frames:
+                print(f"[RecordingManager] Reached {self.max_frames} frames, auto-stopping...")
+                self.stop_recording()
+                return
+
+            try:
+                if self.frame_count % 10 == 0 or self.frame_count == 0:
+                    print(f"[RecordingManager] Capturing frame {self.frame_count + 1}/{self.max_frames}...")
+
+                img = window.get_image_buffer_as_numpy()
+                self.video_manager.write_frame(img)
+                self.frame_count += 1
+
+                if self.frame_count == 1:
+                    print(f"[RecordingManager] First frame captured successfully")
+                elif self.frame_count == self.max_frames:
+                    print(f"[RecordingManager] Final frame ({self.max_frames}) captured")
+
+            except Exception as e:
+                print(f"[RecordingManager ERROR] Failed to capture frame: {e}")
+                import traceback
+                traceback.print_exc()
+
+    def stop_recording(self):
+        """
+        Stop recording and create video file.
+
+        Returns:
+            str: Path to output directory
+        """
+        if self.is_recording[None]:
+            print(f"Finalizing video with {self.frame_count} frames...")
+            self.video_manager.make_video(mp4=True, gif=False)
+            self.is_recording[None] = 0
+
+            video_path = os.path.join(self.output_dir, "video.mp4")
+            print(f"✓ Video saved: {video_path}")
+            print(f"  Frames: {self.frame_count}")
+            print(f"  Duration: {self.frame_count / 10:.1f}s at 10fps")
+
+            return self.output_dir
+        return None
+
+    def render_ui(self, window):
+        """
+        Render recording UI controls with stable layout.
+        Shows progress during recording (Frame X/30).
+
+        Args:
+            window: Taichi GGUI window instance
+        """
+        try:
+            # Recording panel below material controls
+            window.GUI.begin("Recording", 0.62, 0.48, 0.36, 0.18)
+
+            # Status line - changes based on recording state
+            if self.is_recording[None]:
+                window.GUI.text(f"● RECORDING {self.frame_count}/{self.max_frames}")
+            else:
+                window.GUI.text(f"Capture {self.max_frames} frames (3s @ 10fps)")
+
+            # Always show frame count and duration
+            window.GUI.text(f"Frames: {self.frame_count}/{self.max_frames}")
+            window.GUI.text(f"Duration: {self.frame_count / 10:.1f}s / {self.max_frames / 10:.1f}s")
+            window.GUI.text("")
+
+            # Single button that toggles - stays in same position
+            if self.is_recording[None]:
+                # Show progress in button text
+                button_text = f"Recording... {self.frame_count}/{self.max_frames}"
+                if window.GUI.button(button_text):
+                    print("[RecordingManager] Stop Recording button clicked")
+                    self.stop_recording()
+            else:
+                if window.GUI.button("Start Recording"):
+                    print("[RecordingManager] Start Recording button clicked")
+                    self.start_recording()
+
+            window.GUI.end()
+        except Exception as e:
+            print(f"[RecordingManager ERROR] Failed to render UI: {e}")
+            import traceback
+            traceback.print_exc()

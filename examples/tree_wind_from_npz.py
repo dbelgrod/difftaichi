@@ -18,7 +18,7 @@ import numpy as np
 import math
 import sys
 import os
-from tree_controls import MaterialPropertyController
+from tree_controls import MaterialPropertyController, RecordingManager
 
 # Use CPU for better stability, change to ti.gpu if you have a good GPU
 ti.init(arch=ti.cpu)
@@ -31,9 +31,12 @@ inv_dx = 1 / dx
 base_dt = 5e-4  # Base time step for stability
 dt = ti.field(ti.f32, shape=())  # Adaptive time step
 p_vol = 1
-max_steps = 1000  # Extended simulation to see continuous wind effects
+buffer_size = 1000  # Circular buffer size for history
 # gravity and damping_factor are now controlled by MaterialPropertyController
 max_velocity = 5.0  # Velocity clamping threshold
+
+# Actual step counter (can grow infinitely)
+actual_step_count = ti.field(ti.i32, shape=())
 
 # Material properties are now controlled by MaterialPropertyController
 # This allows real-time adjustment via GUI sliders
@@ -57,9 +60,8 @@ grid_v_in = ti.Vector.field(dim, dtype=ti.f32, shape=(n_grid, n_grid, n_grid))
 grid_m_in = ti.field(dtype=ti.f32, shape=(n_grid, n_grid, n_grid))
 grid_v_out = ti.Vector.field(dim, dtype=ti.f32, shape=(n_grid, n_grid, n_grid))
 
-# Control parameters
+# Control parameters (kept for compatibility, but using actual_step_count now)
 # wind_strength is now in material_controller
-current_step = ti.field(ti.i32, shape=())
 
 @ti.kernel
 def clear_grid():
@@ -68,7 +70,7 @@ def clear_grid():
         grid_m_in[i, j, k] = 0
 
 @ti.kernel
-def p2g(f: ti.i32):
+def p2g(f: ti.i32, f_next: ti.i32):
     for p in range(n_particles):
         base = ti.cast(x[f, p] * inv_dx - 0.5, ti.i32)
         fx = x[f, p] * inv_dx - ti.cast(base, ti.i32)
@@ -83,7 +85,7 @@ def p2g(f: ti.i32):
         elif J > 2.5:
             new_F = new_F * ti.pow(2.5 / J, 1.0/3.0)
 
-        F[f + 1, p] = new_F
+        F[f_next, p] = new_F
 
         r, s = ti.polar_decompose(new_F)
 
@@ -119,7 +121,7 @@ def grid_op():
             v_out[1] -= dt[None] * material_controller.gravity[None]
 
             # Add wind force - oscillating with time
-            wind_factor = ti.sin(ti.cast(current_step[None], ti.f32) * 0.01)
+            wind_factor = ti.sin(ti.cast(actual_step_count[None], ti.f32) * 0.01)
             wind_x = material_controller.wind_strength[None] * wind_factor
 
             # Wind affects higher parts more
@@ -156,7 +158,7 @@ def grid_op():
             grid_v_out[i, j, k] = v_out
 
 @ti.kernel
-def g2p(f: ti.i32):
+def g2p(f: ti.i32, f_next: ti.i32):
     for p in range(n_particles):
         base = ti.cast(x[f, p] * inv_dx - 0.5, ti.i32)
         fx = x[f, p] * inv_dx - ti.cast(base, ti.f32)
@@ -182,9 +184,9 @@ def g2p(f: ti.i32):
         if material_id[p] == 0 and x[f, p][1] < 0.15:
             new_v = ti.Vector([0, 0, 0])
 
-        v[f + 1, p] = new_v
-        x[f + 1, p] = x[f, p] + dt[None] * v[f + 1, p]
-        C[f + 1, p] = new_C
+        v[f_next, p] = new_v
+        x[f_next, p] = x[f, p] + dt[None] * v[f_next, p]
+        C[f_next, p] = new_C
 
 @ti.kernel
 def init_particles(x_arr: ti.types.ndarray(ndim=2),
@@ -195,6 +197,7 @@ def init_particles(x_arr: ti.types.ndarray(ndim=2),
             x[0, i][j] = x_arr[i, j]
             v[0, i][j] = v_arr[i, j]
         F[0, i] = ti.Matrix.identity(ti.f32, dim)
+        C[0, i] = ti.Matrix.zero(ti.f32, dim, dim)  # Initialize affine velocity to zero
         particle_type[i] = 1
         material_id[i] = material_id_arr[i]
 
@@ -289,25 +292,24 @@ def calculate_adaptive_timestep():
 
 def update_stiffness_ramp():
     """Gradually increase stiffness to avoid sudden shocks"""
-    if current_step[None] < ramp_steps:
-        stiffness_ramp_factor[None] = (current_step[None] + 1) / ramp_steps
+    if actual_step_count[None] < ramp_steps:
+        stiffness_ramp_factor[None] = (actual_step_count[None] + 1) / ramp_steps
     else:
         stiffness_ramp_factor[None] = 1.0
 
 def simulate_step():
-    step = current_step[None]
-    if step < max_steps - 1:
-        update_stiffness_ramp()
-        calculate_adaptive_timestep()
-        clear_grid()
-        p2g(step)
-        grid_op()
-        g2p(step)
-        current_step[None] = step + 1
-    else:
-        # Auto-restart when simulation ends
-        current_step[None] = 0
-        stiffness_ramp_factor[None] = 0.01
+    """Advance simulation by one step using circular buffer"""
+    step = actual_step_count[None]
+    buffer_idx = step % buffer_size
+    buffer_idx_next = (step + 1) % buffer_size
+
+    update_stiffness_ramp()
+    calculate_adaptive_timestep()
+    clear_grid()
+    p2g(buffer_idx, buffer_idx_next)
+    grid_op()
+    g2p(buffer_idx, buffer_idx_next)
+    actual_step_count[None] = step + 1
 
 def main():
     global n_particles, particle_type, material_id, x, v, C, F, material_controller
@@ -315,6 +317,9 @@ def main():
     # Initialize material property controller
     material_controller = MaterialPropertyController()
     material_controller.init_controls("very_stiff")  # Start with very stiff preset
+
+    # Initialize recording manager
+    recording_manager = RecordingManager()
 
     # Parse command-line arguments
     if len(sys.argv) > 1:
@@ -345,16 +350,16 @@ def main():
     x_np, v_np, material_ids_np, n_particles = load_scene_from_npz(npz_path)
     print(f"\nRunning tree simulation with {n_particles} particles")
 
-    # Allocate fields with correct size
+    # Allocate fields with circular buffer
     particle_type = ti.field(ti.i32, shape=n_particles)
     material_id = ti.field(ti.i32, shape=n_particles)
-    x = ti.Vector.field(dim, dtype=ti.f32, shape=(max_steps, n_particles))
-    v = ti.Vector.field(dim, dtype=ti.f32, shape=(max_steps, n_particles))
-    C = ti.Matrix.field(dim, dim, dtype=ti.f32, shape=(max_steps, n_particles))
-    F = ti.Matrix.field(dim, dim, dtype=ti.f32, shape=(max_steps, n_particles))
+    x = ti.Vector.field(dim, dtype=ti.f32, shape=(buffer_size, n_particles))
+    v = ti.Vector.field(dim, dtype=ti.f32, shape=(buffer_size, n_particles))
+    C = ti.Matrix.field(dim, dim, dtype=ti.f32, shape=(buffer_size, n_particles))
+    F = ti.Matrix.field(dim, dim, dtype=ti.f32, shape=(buffer_size, n_particles))
 
     # Set initial parameters
-    current_step[None] = 0
+    actual_step_count[None] = 0
     stiffness_ramp_factor[None] = 0.01  # Start with very low stiffness
     dt[None] = base_dt
 
@@ -398,7 +403,7 @@ def main():
         if window.get_event(ti.ui.PRESS):
             if window.event.key == ti.ui.SPACE:
                 # Reset simulation
-                current_step[None] = 0
+                actual_step_count[None] = 0
                 stiffness_ramp_factor[None] = 0.01
                 init_particles(x_np, v_np, material_ids_np)
                 print("Simulation reset")
@@ -419,23 +424,19 @@ def main():
         if window.is_pressed(ti.ui.RIGHT):
             material_controller.wind_strength[None] = min(5.0, material_controller.wind_strength[None] + 0.01)
 
-        # Check if preset button was pressed (needs reset)
+        # Check if reset button was pressed
         if material_controller.check_and_clear_reset_flag():
-            current_step[None] = 0
+            actual_step_count[None] = 0
             stiffness_ramp_factor[None] = 0.01
             init_particles(x_np, v_np, material_ids_np)
-            print("Simulation reset with new preset")
+            print("Simulation reset")
 
         # Update simulation
         simulate_step()
 
-        # Check if we need to reinitialize at loop restart
-        if current_step[None] == 0:
-            stiffness_ramp_factor[None] = 0.01
-            init_particles(x_np, v_np, material_ids_np)
-
-        # Update positions for rendering
-        update_positions(positions, current_step[None])
+        # Update positions for rendering (use current buffer index)
+        buffer_idx = actual_step_count[None] % buffer_size
+        update_positions(positions, buffer_idx)
 
         # Render
         camera.track_user_inputs(window, movement_speed=0.03, hold_key=ti.ui.RMB)
@@ -447,14 +448,22 @@ def main():
         # Draw particles with colors
         scene.particles(positions, radius=0.008, per_vertex_color=colors)
 
+        # Render scene to canvas BEFORE adding UI
         canvas.scene(scene)
 
-        # Display info panel
-        window.GUI.begin("Info", 0.02, 0.02, 0.35, 0.30)
-        window.GUI.text(f"Step: {current_step[None]}/{max_steps}")
+        # Capture frame WITHOUT UI if recording
+        # This must happen after canvas.scene() but before GUI elements are added
+        if recording_manager.is_recording[None]:
+            if actual_step_count[None] % 10 == 0:  # Log every 10 frames
+                print(f"[Recording] Capturing frame {recording_manager.frame_count}")
+
+        # Display info panel (will be visible to user but not captured in video)
+        window.GUI.begin("Info", 0.02, 0.02, 0.35, 0.32)
+        window.GUI.text(f"Step: {actual_step_count[None]}")
         window.GUI.text(f"Particles: {n_particles}")
+        window.GUI.text(f"Buffer: {buffer_size}")
         window.GUI.text(f"Wind: {material_controller.wind_strength[None]:.2f}")
-        wind_dir = "→" if math.sin(current_step[None] * 0.01) > 0 else "←"
+        wind_dir = "→" if math.sin(actual_step_count[None] * 0.01) > 0 else "←"
         window.GUI.text(f"Wind dir: {wind_dir}")
         window.GUI.text(f"Wood E: {material_controller.E_wood[None] * stiffness_ramp_factor[None]:.0f}")
         window.GUI.text(f"Leaf E: {material_controller.E_leaf[None]:.1f}")
@@ -467,6 +476,17 @@ def main():
         # Display material controls panel
         material_controller.render_controls(window)
 
+        # Display recording panel
+        if actual_step_count[None] % 30 == 0 and recording_manager.is_recording[None]:
+            print(f"[UI] Rendering recording UI controls")
+        recording_manager.render_ui(window)
+
+        # Capture frame BEFORE showing - must happen before buffer swap!
+        # After window.show() swaps buffers, the back buffer is cleared (black frames)
+        if recording_manager.is_recording[None]:
+            recording_manager.capture_frame(window)
+
+        # Show frame with UI visible to user
         window.show()
 
 if __name__ == '__main__':
